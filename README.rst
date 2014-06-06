@@ -8,7 +8,7 @@ Requirements
 -----------
 
 - Django
-- MySQLdb or PyMysql with install_as_mysqldb
+- Pymysql
 - SQLAlchemy
 
 Install
