@@ -14,4 +14,4 @@ Requirements
 Install
 ------------
 
-$ pip install git+https://
+$ pip install git+https://github.com/danigosa/mysafepool
