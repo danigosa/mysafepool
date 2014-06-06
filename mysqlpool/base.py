@@ -1,6 +1,3 @@
-from django.db import utils
-import sys
-
 __author__ = 'danigosa'
 
 """
@@ -11,7 +8,7 @@ Requires SQLAlchemy: http://www.sqlalchemy.org/
 """
 
 try:
-    import MySQLdb
+    import MySQLdb as Database
 except ImportError, e:
     try:
         import pymysql as Database
