@@ -1,15 +1,26 @@
+import UserDict
+
 __author__ = 'danigosa'
 
 """
-MySQL database backend for Django. Modified to support pooling with SQLAlchemy directly from DATABASES settings
+MySQL database backend for Django in green mode.
+Modified to support pooling with SQLAlchemy directly from DATABASES settings (with SSL support)
 
-Requires MySQLdb: http://sourceforge.net/projects/mysql-python
+Requires Django >= 1.6
+Requires PyMYSQL: https://github.com/PyMySQL/PyMySQL
 Requires SQLAlchemy: http://www.sqlalchemy.org/
 """
 
+# Monkey Patch MysqlDb driver with pymysql
+try:
+    import pymysql
+
+    pymysql.install_as_MySQLdb()
+except ImportError:
+    pass
+
 import pymysql as Database
 from pymysql import OperationalError
-
 import time
 from sqlalchemy import exc
 from sqlalchemy import event
@@ -21,13 +32,18 @@ from django.utils import importlib
 import hashlib
 from django.db import utils
 import sys
+import os
 from django.utils.safestring import SafeBytes, SafeText
 from django.utils import six
 
+
 log = logging.getLogger()
 
-##### CONNECTION POOLING ######
+# Pool settings
 POOL_SETTINGS = getattr(settings, 'SQLALCHEMY_POOL_OPTIONS', {})
+
+# Global variable to hold the actual connection pool.
+MYSQLPOOL = None
 
 
 class hashabledict(dict):
@@ -44,6 +60,7 @@ def mysql_connection_retry(fn):
     """
     Default settings retrials
     """
+
     def db_op_wrapper(*args, **kwargs):
         retries = settings.MYSQL_CONNECT_DEFAULT_RETRIALS
         for i in xrange(retries):
@@ -58,10 +75,32 @@ def mysql_connection_retry(fn):
     return db_op_wrapper
 
 
+def _hash_kwargs(kwargs):
+    if 'conv' in kwargs:
+        conv = kwargs['conv']
+        if isinstance(conv, dict):
+            items = []
+            for k, v in conv.items():
+                if isinstance(v, list):
+                    v = hashablelist(v)
+                items.append((k, v))
+            kwargs['conv'] = hashabledict(items)
+    if 'ssl' in kwargs:
+        ssl = kwargs['ssl']
+        if isinstance(ssl, dict):
+            items = []
+            for k, v in ssl.items():
+                if isinstance(v, list):
+                    v = hashablelist(v)
+                items.append((k, v))
+            kwargs['ssl'] = hashabledict(items)
+
+
 class ManagerProxy(object):
     """
     Manage connections through the pool
     """
+
     def __init__(self, manager):
         self.manager = manager
 
@@ -110,30 +149,69 @@ def ping_connection(dbapi_connection, connection_record, connection_proxy):
         raise exc.DisconnectionError()
     cursor.close()
 
-# Init backend with proxied Database
-pool_initialized = False
-log.debug('Init Managed Databased...')
-
-db_pool = ManagerProxy(pool.manage(Database, **POOL_SETTINGS))
-
-django_backend_module = importlib.import_module('django.db.backends.mysql.base')
-
 
 def serialize(**kwargs):
-    # We need to figure out what database connection goes where
-    # so we'll hash the args.
+    """
+    We need to figure out what database connection goes where
+    so we'll hash the args.
+    :param kwargs:
+    :return: md5 encoded args
+    """
     keys = sorted(kwargs.keys())
     out = [repr(k) + repr(kwargs[k])
            for k in keys if isinstance(kwargs[k], (str, int, bool))]
     return hashlib.md5(''.join(out)).hexdigest()
 
 
+def _get_pool():
+    """
+    Creates one and only one pool using the configured settings
+    """
+    global MYSQLPOOL
+    if MYSQLPOOL is None:
+        MYSQLPOOL = ManagerProxy(pool.manage(Database, **POOL_SETTINGS))
+        setattr(MYSQLPOOL, '_pid', os.getpid())
+    if getattr(MYSQLPOOL, '_pid', None) != os.getpid():
+        pool.clear_managers()
+    return MYSQLPOOL
+
+
+def _connect(**kwargs):
+    """
+    Obtains a database connection from the connection pool
+    """
+    if 'conv' in kwargs:
+        conv = kwargs['conv']
+        if isinstance(conv, dict):
+            items = []
+            for k, v in conv.items():
+                if isinstance(v, list):
+                    v = hashablelist(v)
+                items.append((k, v))
+            kwargs['conv'] = hashabledict(items)
+    if 'ssl' in kwargs:
+        ssl = kwargs['ssl']
+        if isinstance(ssl, dict):
+            items = []
+            for k, v in ssl.items():
+                if isinstance(v, list):
+                    v = hashablelist(v)
+                items.append((k, v))
+            kwargs['ssl'] = hashabledict(items)
+    return _get_pool().connect(**kwargs)
+
+django_backend_module = importlib.import_module('django.db.backends.mysql.base')
+
+
 class DatabaseCreation(django_backend_module.DatabaseCreation):
-    # The creation flips around between databases in a way that the pool
-    # doesn't like. After the db is created, reset the pool.
+    """
+    The creation flips around between databases in a way that the pool
+    doesn't like. After the db is created, reset the pool.
+    """
+
     def _create_test_db(self, *args):
         result = super(DatabaseCreation, self)._create_test_db(*args)
-        db_pool.close()
+        _get_pool().close()
         return result
 
 
@@ -143,57 +221,65 @@ class SafeCursorWrapper(django_backend_module.CursorWrapper):
     Errors with retrial: 1205, 2006, 2013
     """
 
-    codes_for_connectionerror = ('2006', '2013')
+    codes_for_connectionerror = ('1205', '2006', '2013')
 
     def execute(self, query, args=None):
         try:
             return self.cursor.execute(query, args)
         except django_backend_module.Database.IntegrityError, e:
-            raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
+            if e[0] in self.codes_for_integrityerror:
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            raise
         except django_backend_module.Database.OperationalError, e:
             # Map some error codes to IntegrityError, since they seem to be
             # misclassified and Django would prefer the more logical place.
             if e[0] in self.codes_for_connectionerror:
                 # Refresh cursor with a new connection and retry
-                connection = db_pool.connect(**POOL_SETTINGS)
+                connection = _get_pool().connect(**POOL_SETTINGS)
 
-                connection.encoders[django_backend_module.SafeUnicode] = connection.encoders[unicode]
-                connection.encoders[django_backend_module.SafeString] = connection.encoders[str]
+                connection.encoders[SafeText] = connection.encoders[six.text_type]
+                connection.encoders[SafeBytes] = connection.encoders[bytes]
 
                 django_backend_module.connection_created.send(sender=self.__class__, connection=self)
                 self.cursor = connection.cursor()
                 return self.cursor.execute(query, args)
 
             elif e[0] in self.codes_for_integrityerror:
-                raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
-            raise utils.DatabaseError, utils.DatabaseError(*tuple(e)), sys.exc_info()[2]
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            raise
         except django_backend_module.Database.DatabaseError, e:
-            raise utils.DatabaseError, utils.DatabaseError(*tuple(e)), sys.exc_info()[2]
+            if e[0] in self.codes_for_integrityerror:
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            raise
 
     def executemany(self, query, args):
         try:
             return self.cursor.executemany(query, args)
         except django_backend_module.Database.IntegrityError, e:
-            raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
+            if e[0] in self.codes_for_integrityerror:
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            raise
         except django_backend_module.Database.OperationalError, e:
             # Map some error codes to IntegrityError, since they seem to be
             # misclassified and Django would prefer the more logical place.
             if e[0] in self.codes_for_connectionerror:
                 # Refresh cursor with a new connection and retry
-                connection = db_pool.connect(**POOL_SETTINGS)
+                connection = _get_pool().connect(**POOL_SETTINGS)
 
-                connection.encoders[django_backend_module.SafeUnicode] = connection.encoders[unicode]
-                connection.encoders[django_backend_module.SafeString] = connection.encoders[str]
+                connection.encoders[SafeText] = connection.encoders[six.text_type]
+                connection.encoders[SafeBytes] = connection.encoders[bytes]
 
                 django_backend_module.connection_created.send(sender=self.__class__, connection=self)
                 self.cursor = connection.cursor()
                 return self.cursor.executemany(query, args)
 
             elif e[0] in self.codes_for_integrityerror:
-                raise utils.IntegrityError, utils.IntegrityError(*tuple(e)), sys.exc_info()[2]
-            raise utils.DatabaseError, utils.DatabaseError(*tuple(e)), sys.exc_info()[2]
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            raise
         except django_backend_module.Database.DatabaseError, e:
-            raise utils.DatabaseError, utils.DatabaseError(*tuple(e)), sys.exc_info()[2]
+            if e[0] in self.codes_for_integrityerror:
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            raise
 
 
 class DatabaseWrapper(django_backend_module.DatabaseWrapper):
@@ -241,7 +327,15 @@ class DatabaseWrapper(django_backend_module.DatabaseWrapper):
         """
         if self.connection is None:
             _settings = self._serialize()
-            self.connection = db_pool.connect(**_settings)
+            self.connection = _get_pool().connect(**_settings)
+
+            self.connection.encoders[SafeText] = \
+                self.connection.encoders[six.text_type]
+            self.connection.encoders[SafeBytes] = \
+                self.connection.encoders[bytes]
+
+            django_backend_module.connection_created.send(sender=self.__class__,
+                                                          connection=self)
 
     def _rollback(self):
         # Connection has been lost, lets put it out from the pool
@@ -251,27 +345,10 @@ class DatabaseWrapper(django_backend_module.DatabaseWrapper):
         if self.connection:
             self.connection.close()
 
-    def _is_valid_connection(self):
-        # If you don't want django to check that the connection is valid,
-        # then set DATABASE_POOL_CHECK to False.
-        if getattr(settings, 'MYSQL_DJANGO_CONNECTION_CHECK', True):
-            return self._valid_connection()
-        # Force connection refreshing in each cursor created
-        return False
+    def create_cursor(self):
+        return SafeCursorWrapper(self.connection.cursor())
 
     def _cursor(self):
         self.ensure_connection()
-        if not self._is_valid_connection():
-            _settings = self._serialize()
-            self.connection = db_pool.connect(**_settings)
-
-            self.connection.encoders[SafeText] =\
-                    self.connection.encoders[six.text_type]
-            self.connection.encoders[SafeBytes] =\
-                    self.connection.encoders[bytes]
-
-            django_backend_module.connection_created.send(sender=self.__class__,
-                                                   connection=self)
-
-        cursor = SafeCursorWrapper(self.connection.cursor())
-        return cursor
+        with self.wrap_database_errors:
+            return self.create_cursor()
