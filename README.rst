@@ -7,7 +7,7 @@ An extension of mysql pooling with SQLAlchemy and PyMYSQL or MySQLdb
 Requirements
 -----------
 
-- Django
+- Django 1.6
 - Pymysql
 - SQLAlchemy
 
